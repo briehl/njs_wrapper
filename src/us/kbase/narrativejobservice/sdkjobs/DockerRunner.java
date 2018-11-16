@@ -25,6 +25,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 
 public class DockerRunner {
@@ -34,13 +35,12 @@ public class DockerRunner {
     public static DockerClient cl;
 
     private final URI dockerURI;
-    private File workDir;
     private File tokenFile;
+    private File workDir;
 
     public DockerRunner(final URI dockerURI) {
         this.dockerURI = dockerURI;
     }
-
 
     private List<Bind> getBinds(File workDir, File refDataDir, File optionalScratchDir, List<Bind> additionalBinds) {
         List<Bind> binds = new ArrayList<Bind>(Arrays.asList(new Bind(workDir.getAbsolutePath(),
@@ -188,6 +188,7 @@ public class DockerRunner {
         }
         return cancellationCheckingThread;
     }
+
     private void cleanupAfterJob(String cntName, boolean removeImage, String imageName) {
         if (cntName != null) {
             Container cnt = findContainerByNameOrIdPrefix(cl, cntName);
@@ -239,9 +240,7 @@ public class DockerRunner {
         String cntName = null;
         String cntId = null;
 
-
         try {
-
             cl = createDockerClient();
             setupForJob(inputData, token, outputFile);
             imageName = checkImagePulled(cl, imageName, log);
@@ -280,15 +279,15 @@ public class DockerRunner {
                 workers.add(ret);
             }
 
-            final String  cntID = cntId;
-
-
             Thread cancellationCheckingThread = createCancellationChecking(cancellationChecker, cntId, moduleName, log);
+            if (cancellationCheckingThread != null)
+                cancellationCheckingThread.start();
 
 
             for (Thread t : workers)
                 t.join();
-            p.waitFor();
+            log.logNextLine(String.format("Job %s will automatically timeout in %s seconds", cntName,timeout), false);
+            p.waitFor(Long.parseLong(timeout), TimeUnit.SECONDS);
 
             int containerExitCode = cl.waitContainerCmd(cntId).exec(new WaitContainerResultCallback()).awaitStatusCode();
             if (containerExitCode == 125 || containerExitCode == 126 || containerExitCode == 128) {
@@ -308,22 +307,54 @@ public class DockerRunner {
                 } catch (Exception ex) {
                     ex.printStackTrace();
                 }
-                throw new IllegalStateException("Container was still running");
+                log.logNextLine("Container was still running after timeout!", true);
             }
+
 
             if (outputFile.exists()) {
                 return outputFile;
-            } else {
-                if (cancellationChecker != null && cancellationChecker.isJobCanceled())
-                    return null;
-                int exitCode = resp2.getState().getExitCode();
-                String msg = "Output file is not found, exit code is " + exitCode;
-                throw new IllegalStateException(msg );
             }
+            if (cancellationChecker != null && cancellationChecker.isJobCanceled())
+                return null;
+
+            int exitCode = resp2.getState().getExitCode();
+            String msg = "Output file is not found, exit code is " + exitCode;
+            throw new IllegalStateException(msg);
+
+
         } finally {
-            cleanupAfterJob(cntName,removeImage,imageName);
+            cleanupAfterJob(cntName, removeImage, imageName);
         }
     }
+
+    //TODO UNUSED FOR NOW
+    private void getLogs(String cntId, String workDir) throws Exception {
+        LogContainerCmd logContainerCmd = cl.logContainerCmd(cntId).withStdOut(true).withStdErr(true).withTimestamps(true);
+
+        final List<String> logs = new ArrayList<>();
+        final List<String> err_logs = new ArrayList<>();
+
+        try {
+            logContainerCmd.exec(new LogContainerResultCallback() {
+                @Override
+                public void onNext(Frame item) {
+                    logs.add(item.toString());
+                    if (item.getStreamType().equals(StreamType.STDERR)) {
+                        err_logs.add(item.toString());
+                    }
+                }
+            }).awaitCompletion(30, TimeUnit.SECONDS);
+        } catch (InterruptedException ex) {
+            ex.printStackTrace();
+        }
+
+        FileWriter writer = new FileWriter(new File(workDir, "docker.log"));
+        for (String str : logs) {
+            writer.write(str);
+        }
+        writer.close();
+    }
+
 
     /**
      * Get a list of subjob docker ids from the dockerJobIdLogsDir
@@ -453,19 +484,19 @@ public class DockerRunner {
                 int cpuQuota = (int) (inputCores * CPU_QUOTA_CONST);
                 cpuMemoryLimiter.withCpuQuota(cpuQuota);
                 cpuMemoryLimiter.withCpuPeriod(DEFAULT_CPU_PERIOD);
-                log.logNextLine("Setting request_cpus Requirements to " + inputCores, true);
-                log.logNextLine("Setting cpuQuota  to " + cpuQuota, true);
-                log.logNextLine("Setting withCpuPeriod  to " + DEFAULT_CPU_PERIOD, true);
+                log.logNextLine("Setting request_cpus Requirements to " + inputCores, false);
+                log.logNextLine("Setting cpuQuota  to " + cpuQuota, false);
+                log.logNextLine("Setting withCpuPeriod  to " + DEFAULT_CPU_PERIOD, false);
             }
             if (resourceKey.equals("request_memory")) {
                 String inputMemory = resourceRequirements.get("request_memory").replace("MB", "");
                 long inputMemoryBytes = Long.parseLong(inputMemory) * 1000000L;
                 //cpuMemoryLimiter.withMemory(inputMemoryBytes); //hard memory limit
                 cpuMemoryLimiter.withMemoryReservation(inputMemoryBytes); //soft memory limit
-                log.logNextLine("Setting request_memory Requirements to " + inputMemory, true);
-                log.logNextLine("Setting withMemoryReservation  to " + inputMemoryBytes, true);
+                log.logNextLine("Setting request_memory Requirements to " + inputMemory, false);
+                log.logNextLine("Setting withMemoryReservation  to " + inputMemoryBytes, false);
                 if (Long.parseLong(inputMemory) <= 500) {
-                    log.logNextLine("WARNING: withMemoryReservation MIGHT BE TOO LOW ", true);
+                    log.logNextLine("WARNING: withMemoryReservation MIGHT BE TOO LOW ", false);
                 }
             }
         }
